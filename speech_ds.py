@@ -1,4 +1,5 @@
 import os
+from numpy.lib.stride_tricks import as_strided
 import scipy.io.wavfile as wav
 import numpy as np
 import fnmatch
@@ -6,7 +7,10 @@ import pickle
 import tables
 import csv
 import theano
+import time
 from audio_tools import wdct, iwdct
+
+fft_size = 64
 
 def get_dataset_dir(dataset_name):
     """ Get dataset directory path """
@@ -36,35 +40,35 @@ def fetch_blizzard(sz=100):
     hdf5_path = os.path.join(partial_path, "blizzard_{}_saved.hdf5".format(sz))
 
     all_transcripts = []
-    pcms = []
-    pcms_lens = []
-    mx = np.zeros(64)
     all_chars = ([chr(ord('a') + i) for i in range(26)] +
                  [',', '.', '!', '?', '<UNK>'])
     
     code2char = dict(enumerate(all_chars))
     char2code = {v: k for k, v in code2char.items()}
     vocabulary_size = len(char2code.keys())
-    fft_size = 64
 
     if not os.path.exists(hdf5_path):
         print ('Building', hdf5_path, 'fft size', fft_size, 'vocab size', vocabulary_size)
+        filters = tables.Filters(complevel=5, complib='blosc')
         hdf5_file = tables.openFile(hdf5_path, mode='w')
+        chunk_depth = fft_size*1000
+        chunked_data_storage = hdf5_file.createEArray(hdf5_file.root, 'chunked_data',
+                                                      tables.Float32Atom(),
+                                                      shape=(0, chunk_depth),
+                                                      filters=filters)
+
         data_storage = hdf5_file.create_vlarray(hdf5_file.root, 'data', tables.Float32Atom(shape=(fft_size)),
                                                 "audio representation ",
-                                                filters=tables.Filters(1))
+                                                filters=filters)
         length_storage = hdf5_file.create_vlarray(hdf5_file.root, 'length',
                                                   tables.Int32Atom(shape=()),
-                                                  "wav len in samples",
-                                                  filters=tables.Filters(1))
+                                                  "wav len in samples")
         offset_storage = hdf5_file.create_vlarray(hdf5_file.root, 'offset',
                                                   tables.Int64Atom(shape=()),
-                                                  "wav len in samples",
-                                                  filters=tables.Filters(1))
+                                                  "wav len in samples")
         text_storage = hdf5_file.create_vlarray(hdf5_file.root, 'text',
                                                 tables.StringAtom(itemsize=2),
-                                                "ragged array of strings",
-                                                filters=tables.Filters(1))
+                                                "ragged array of strings")
         text_storage.flavor = 'python'
         
         text_1hot_storage = hdf5_file.create_vlarray(hdf5_file.root, 'text_1hot', tables.Float32Atom(shape=(vocabulary_size)),
@@ -72,44 +76,47 @@ def fetch_blizzard(sz=100):
                                                 filters=tables.Filters(1))
 
         rng = np.random.RandomState(1999)
+        seq_offset = 0
+        tail = np.zeros((1, chunk_depth))
         with open(os.path.join(partial_path, "prompts_{}.txt".format(sz)), 'rb') as f_p:
             utts = csv.reader(f_p, delimiter='\t')
             l=list(utts)
             rng.shuffle(l)
-            for u in l:
+            for n, u in enumerate(l):
                 print ("{}.wav".format(u[0]), u[1])
                 fs, w = wav.read(os.path.join(partial_path, "wavn_{}".format(sz), "{}.wav".format(u[0])))
-                print w.shape
+                print (w.shape)
                 if fs != 8000 and fs != 16000:
-                    print "Unexpected sampling rate in %s" % u[0]
+                    print ("Unexpected sampling rate in %s" % u[0])
                     raise
                 if fs == 16000:
                     w = w[::2]
                 w_i = wdct(w)
-                data_storage.append(w_i)
+                # not chunked auido is only for tests
+                if n < 1000:
+                    data_storage.append(w_i)
+                length_storage.append([len(w_i)])
                 text_storage.append(u[1].lower())
                 text_1hot_storage.append(tokenize_ind(u[1].lower(), char2code))
+                offset_storage.append([seq_offset])
+                z = as_strided(w_i, strides=(w_i.itemsize*chunk_depth, w_i.itemsize), shape = [np.prod(w_i.shape)//chunk_depth, chunk_depth] )
+                chunked_data_storage.append(z)
+                seq_offset += len(z)
+                r = np.prod(w_i.shape) - np.prod(z.shape)
+                if r > 0:
+                    tail[0, :r] = w_i.reshape(-1)[-r:]
+                    tail[0, r:] = 1
+                    seq_offset += 1
+                    chunked_data_storage.append(tail)
+        offset_storage.append([seq_offset])
         hdf5_file.close()
         
     hdf5_file = tables.openFile(hdf5_path, mode='r')
-
-
-        #all_pcm_max = [np.amax(np.abs(b), axis=0) for b in pcms]
-        #mx = np.max(np.vstack(all_pcm_max), axis = 0) 
-        #pcms = [ p / mx for p in pcms ]
-
-        #num_examples = len(pcms)
-        # Shuffle for train/validation/test division
-        #rng = np.random.RandomState(1999)
-        #shuffle_idx = rng.permutation(num_examples)
-
-        #pcms = [pcms[x] for x in shuffle_idx]
-        #all_transcripts = [all_transcripts[x] for x in shuffle_idx]
-
-
-
     pickle_dict = {}
     pickle_dict["data"] = hdf5_file.root.data
+    pickle_dict["data_offset"] = hdf5_file.root.offset
+    pickle_dict["chunked_data"] = hdf5_file.root.chunked_data
+    pickle_dict["data_length"] = hdf5_file.root.length
     pickle_dict["target_phrases"] = hdf5_file.root.text
     pickle_dict["vocabulary_size"] = vocabulary_size
     pickle_dict["vocabulary_tokenizer"] = tokenize_ind
@@ -144,7 +151,8 @@ class base_iterator(object):
         self.reset()
     def reset(self):
         if self.stop_index == np.inf:
-            num_examples = len(self.list_of_containers[0]) - self.start_index
+            num_examples = min([len(i) for i in self.list_of_containers]) - self.start_index
+            self.stop_index = num_examples + self.start_index
         else:
             num_examples = self.stop_index - self.start_index
         self.shuffle_idx = np.append(np.zeros(self.start_index, dtype=np.int), self.rng.permutation(num_examples) + self.start_index)
@@ -157,6 +165,7 @@ class base_iterator(object):
 
     def __next__(self):
         self.slice_end_ = self.slice_start_ + self.minibatch_size
+        print(self.slice_end_, self.stop_index)
         if self.slice_end_ > self.stop_index:
             # TODO: Think about boundary issues with weird shaped last mb
             self.reset()
@@ -164,8 +173,8 @@ class base_iterator(object):
         if self.shuffle :
             ind = self.shuffle_idx[self.slice_start_:self.slice_end_]
         else:
-            ind = slice(self.slice_start_, self.slice_end_)
-        #print ('ind', ind, self.slice_start_, self.slice_end_)
+            ind = np.arange(self.slice_start_, self.slice_end_)
+        print ('ind', ind, self.slice_start_, self.slice_end_)
         self.slice_start_ = self.slice_end_
         if self.make_mask is False:
             res = self._slice_without_masks(ind)
@@ -240,39 +249,120 @@ class list_iterator(base_iterator):
             ms = [self._mask_like(c[:, :, 0], corg) for c, corg in zip(cs, sliced_c)]
         assert len(cs) == len(ms)
         return [i for sublist in list(zip(cs, ms)) for i in sublist]
+    
+class pair_audio_oh_iterator(base_iterator):
+    def set_audio_length_and_offset(self, length, offset):
+        self.length = length
+        self.offset = offset
+    def _slice_without_masks(self, ind):
+        assert False
+    def _chunk_indexes(self, seq_ind):
+        rv = {}
+        for i in seq_ind:
+            rv[i] = range(self.offset[i], self.offset[i+1])
+        return rv
+    def _slice_with_masks(self, ind):
+        print ([c.shape for c in self.list_of_containers])
+        oh_txt = self.list_of_containers[1]
 
+        chunk_ind = self._chunk_indexes(ind)
         
-if __name__ == "__main__":
-    import argparse
-    import theano
-    d = fetch_blizzard(sz='fruit')
+        audio_maxlen = max(self.length[ind])
+        print ('audio mlen:', audio_maxlen)
+        oh_maxlen = max([len(oh_txt[i]) for i in ind])
+        print ('oh mlen:', oh_maxlen, oh_txt.dtype)
+        audio = self.list_of_containers[0]
+        audio_sc = np.zeros((audio_maxlen, len(ind), fft_size), dtype=audio[0].dtype)
+        audio_sc_mask = np.zeros((audio_maxlen, len(ind)), dtype=audio[0].dtype)
+        oh_depth = oh_txt[0].shape[1]
+        oh_sc = np.zeros((oh_maxlen, len(ind), oh_depth),  dtype=oh_txt[0].dtype)
+        oh_sc_mask = np.zeros((oh_maxlen, len(ind)), dtype=oh_txt[0].dtype)
+        for b, i in enumerate(ind):
+            p = 0
+            for j in chunk_ind[i]:
+                audio_j = audio[j].reshape(-1, fft_size)
+                q = p + audio_j.shape[0]
+                q = min(q, self.length[i])
+                audio_sc[p:q, b ] = audio_j[:q-p]
+                audio_sc_mask[p:q, b ] = 1.
+                p += audio_j.shape[0]
+            oh_sc[:len(oh_txt[i]),b] = oh_txt[i]
+            oh_sc_mask[:len(oh_txt[i]), b ] = 1.
+        return audio_sc, audio_sc_mask, oh_sc, oh_sc_mask
+
+def test_iter(d):
     X = d["data"]
+    X_c = d["chunked_data"]
+    X_l = d["data_length"]
     y = d["target"]
     vocabulary = d["vocabulary"]
     vocabulary_size = d["vocabulary_size"]
-    minibatch_size = 2
-    train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=20,
-                              make_mask=True, shuffle=True)
-    valid_itr = list_iterator([X, y], 20, axis=1, start_index=80,
+    minibatch_size = 21
+    train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=800,
                               make_mask=True, shuffle=False)
+    train_itr2 = pair_audio_oh_iterator([X_c, y], minibatch_size, axis=1, stop_index=800,
+                                       make_mask=True, shuffle=False)
+    train_itr2.set_audio_length_and_offset(d["data_length"], d["data_offset"])
     try:
         while True:
-            X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
+            X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr2)
+            X_mb1, X_mb_mask1, c_mb1, c_mb_mask1 = next(train_itr)
+            print(np.where(X_mb_mask != X_mb_mask1) )
+            print(X_mb_mask.shape, X_mb_mask1.shape)
+            #import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
+            #raise ValueError()
+            assert np.array_equal(X_mb, X_mb1) 
+            assert np.array_equal(X_mb_mask, X_mb_mask1) 
+            assert np.array_equal(c_mb, c_mb1) 
+            assert np.array_equal(c_mb_mask, c_mb_mask1) 
     except StopIteration:
         pass
-    print "done first pass"
-    try:
-        while True:
-            X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
-    except StopIteration:
-        pass
-    print "done second pass"
+    
+    
+if __name__ == "__main__":
+    import argparse
+    import theano
+    d = fetch_blizzard(sz='1000')
+    test_iter(d)
+    X = d["data"]
+    X_c = d["chunked_data"]
+    X_l = d["data_length"]
+    y = d["target"]
+    vocabulary = d["vocabulary"]
+    vocabulary_size = d["vocabulary_size"]
+    minibatch_size = 50
+
+
+    train_itr = list_iterator([X, y], minibatch_size, axis=1, stop_index=800,
+                              make_mask=True, shuffle=True)
+    train_itr2 = pair_audio_oh_iterator([X_c, y], minibatch_size, axis=1, stop_index=800,
+                              make_mask=True, shuffle=True)
+    train_itr2.set_audio_length_and_offset(d["data_length"], d["data_offset"])
+    valid_itr = list_iterator([X, y], minibatch_size, axis=1, start_index=800,
+                              make_mask=True, shuffle=False)
     try:
         while True:
             X_mb, X_mb_mask, c_mb, c_mb_mask = next(valid_itr)
     except StopIteration:
         pass
-    print "done valid pass"
+    print ("done valid pass")
+    start = time.time()
+    try:
+        while True:
+            X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr2)
+    except StopIteration:
+        pass
+    
+    print ("done first pass, took:")
+    print (time.time() - start)
+    start = time.time()
+    try:
+        while True:
+            X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
+    except StopIteration:
+        pass
+    print ("done second pass, took :")
+    print (time.time() - start)
 
     from IPython import embed; embed()
     raise ValueError()

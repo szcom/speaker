@@ -556,7 +556,7 @@ if __name__ == "__main__":
     import argparse
 
     blizzarddb = speech_ds.fetch_blizzard(sz='fruit')
-    X = blizzarddb["data"]
+    X = blizzarddb["chunked_data"]
     y = blizzarddb["target"]
     vocabulary = blizzarddb["vocabulary"]
     vocabulary_size = blizzarddb["vocabulary_size"]
@@ -566,10 +566,12 @@ if __name__ == "__main__":
     cut_len = 300  # Used way at the bottom in the training loop!
     random_state = np.random.RandomState(1999)
 
-    train_itr = speech_ds.list_iterator([X, y], minibatch_size, axis=1, stop_index=80,
+    train_itr = speech_ds.pair_audio_oh_iterator([X, y], minibatch_size, axis=1, stop_index=80,
                                         make_mask=True)
-    valid_itr = speech_ds.list_iterator([X, y], minibatch_size, axis=1, start_index=80,
+    valid_itr = speech_ds.pair_audio_oh_iterator([X, y], minibatch_size, axis=1, start_index=80,
                                         make_mask=True)
+    train_itr.set_audio_length_and_offset(blizzarddb["data_length"], blizzarddb["data_offset"])
+    valid_itr.set_audio_length_and_offset(blizzarddb["data_length"], blizzarddb["data_offset"])
 
     X_mb, X_mb_mask, c_mb, c_mb_mask = next(train_itr)
     train_itr.reset()
