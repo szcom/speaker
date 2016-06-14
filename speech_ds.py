@@ -81,9 +81,9 @@ def fetch_blizzard(sz=100):
         with open(os.path.join(partial_path, "prompts_{}.txt".format(sz)), 'rb') as f_p:
             utts = csv.reader(f_p, delimiter='\t')
             l=list(utts)
-            rng.shuffle(l)
+            l=sorted(l, key=lambda u: len(u[1]))
             for n, u in enumerate(l):
-                print ("{}.wav".format(u[0]), u[1])
+                print ("{}.wav".format(u[0]), u[1], len(u[1]))
                 fs, w = wav.read(os.path.join(partial_path, "wavn_{}".format(sz), "{}.wav".format(u[0])))
                 print (w.shape)
                 if fs != 8000 and fs != 16000:
