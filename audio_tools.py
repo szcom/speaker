@@ -2316,7 +2316,8 @@ def iwdct(X_dct_sub, n_fft):
     X_irr = real_to_complex_view(X_idct)
     X_r = istft(X_irr, n_fft)
     return X_r
-    
+
+
 def run_16k_fft_dct_example2():
     random_state = np.random.RandomState(1999)
 

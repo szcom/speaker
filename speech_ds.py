@@ -9,8 +9,7 @@ import csv
 import theano
 import time
 from audio_tools import wdct, iwdct
-
-fft_size = 64
+from kdllib import apply_quantize_preproc
 
 def get_dataset_dir(dataset_name):
     """ Get dataset directory path """
@@ -35,7 +34,7 @@ def tokenize_ind(phrase, vocabulary):
     phrase = dense_to_one_hot(phrase, vocabulary_size)
     return phrase
 
-def fetch_blizzard(sz=100):
+def fetch_blizzard(sz=100, frame_size=4):
     partial_path = get_dataset_dir("blizzard")
     hdf5_path = os.path.join(partial_path, "blizzard_{}_saved.hdf5".format(sz))
 
@@ -48,16 +47,16 @@ def fetch_blizzard(sz=100):
     vocabulary_size = len(char2code.keys())
 
     if not os.path.exists(hdf5_path):
-        print ('Building', hdf5_path, 'fft size', fft_size, 'vocab size', vocabulary_size)
+        print ('Building', hdf5_path, 'frame size', frame_size, 'vocab size', vocabulary_size)
         filters = tables.Filters(complevel=5, complib='blosc')
         hdf5_file = tables.openFile(hdf5_path, mode='w')
-        chunk_depth = fft_size*1000
+        chunk_depth = 64*1000
         chunked_data_storage = hdf5_file.createEArray(hdf5_file.root, 'chunked_data',
                                                       tables.Float32Atom(),
                                                       shape=(0, chunk_depth),
                                                       filters=filters)
 
-        data_storage = hdf5_file.create_vlarray(hdf5_file.root, 'data', tables.Float32Atom(shape=(fft_size)),
+        data_storage = hdf5_file.create_vlarray(hdf5_file.root, 'data', tables.Float32Atom(shape=(frame_size)),
                                                 "audio representation ",
                                                 filters=filters)
         length_storage = hdf5_file.create_vlarray(hdf5_file.root, 'length',
@@ -91,7 +90,9 @@ def fetch_blizzard(sz=100):
                     raise
                 if fs == 16000:
                     w = w[::2]
-                w_i = wdct(w)
+                append = np.zeros((frame_size - len(w) % frame_size))
+                w = np.hstack((w,append))
+                w_i = apply_quantize_preproc([w])[0].reshape((-1, frame_size))
                 # not chunked auido is only for tests
                 if n < 1000:
                     data_storage.append(w_i)
@@ -128,11 +129,12 @@ def fetch_blizzard(sz=100):
 class base_iterator(object):
     def __init__(self, list_of_containers, minibatch_size,
                  axis,
-                 start_index=0,
-                 stop_index=np.inf,
-                 make_mask=False,
-                 one_hot_class_size=None,
-                 shuffle=True):
+                 start_index = 0,
+                 stop_index = np.inf,
+                 make_mask = False,
+                 one_hot_class_size = None,
+                 shuffle=True,
+                 frame_size = 4):
         self.list_of_containers = list_of_containers
         self.minibatch_size = minibatch_size
         self.make_mask = make_mask
@@ -140,6 +142,7 @@ class base_iterator(object):
         self.stop_index = stop_index
         self.slice_start_ = start_index
         self.axis = axis
+        self.frame_size = frame_size
         if axis not in [0, 1]:
             raise ValueError("Unknown sample_axis setting %i" % axis)
         self.one_hot_class_size = one_hot_class_size
@@ -165,7 +168,7 @@ class base_iterator(object):
 
     def __next__(self):
         self.slice_end_ = self.slice_start_ + self.minibatch_size
-        print(self.slice_end_, self.stop_index)
+        #print(self.slice_end_, self.stop_index)
         if self.slice_end_ > self.stop_index:
             # TODO: Think about boundary issues with weird shaped last mb
             self.reset()
@@ -174,7 +177,7 @@ class base_iterator(object):
             ind = self.shuffle_idx[self.slice_start_:self.slice_end_]
         else:
             ind = np.arange(self.slice_start_, self.slice_end_)
-        print ('ind', ind, self.slice_start_, self.slice_end_)
+        #print ('ind', ind, self.slice_start_, self.slice_end_)
         self.slice_start_ = self.slice_end_
         if self.make_mask is False:
             res = self._slice_without_masks(ind)
@@ -262,17 +265,17 @@ class pair_audio_oh_iterator(base_iterator):
             rv[i] = range(self.offset[i], self.offset[i+1])
         return rv
     def _slice_with_masks(self, ind):
-        print ([c.shape for c in self.list_of_containers])
+        #print ([c.shape for c in self.list_of_containers])
         oh_txt = self.list_of_containers[1]
 
         chunk_ind = self._chunk_indexes(ind)
         
         audio_maxlen = max(self.length[ind])
-        print ('audio mlen:', audio_maxlen)
+        #print ('audio mlen:', audio_maxlen)
         oh_maxlen = max([len(oh_txt[i]) for i in ind])
-        print ('oh mlen:', oh_maxlen, oh_txt.dtype)
+        #print ('oh mlen:', oh_maxlen, oh_txt.dtype)
         audio = self.list_of_containers[0]
-        audio_sc = np.zeros((audio_maxlen, len(ind), fft_size), dtype=audio[0].dtype)
+        audio_sc = np.zeros((audio_maxlen, len(ind), self.frame_size), dtype=audio[0].dtype)
         audio_sc_mask = np.zeros((audio_maxlen, len(ind)), dtype=audio[0].dtype)
         oh_depth = oh_txt[0].shape[1]
         oh_sc = np.zeros((oh_maxlen, len(ind), oh_depth),  dtype=oh_txt[0].dtype)
@@ -280,7 +283,7 @@ class pair_audio_oh_iterator(base_iterator):
         for b, i in enumerate(ind):
             p = 0
             for j in chunk_ind[i]:
-                audio_j = audio[j].reshape(-1, fft_size)
+                audio_j = audio[j].reshape(-1, self.frame_size)
                 q = p + audio_j.shape[0]
                 q = min(q, self.length[i])
                 audio_sc[p:q, b ] = audio_j[:q-p]
@@ -322,7 +325,7 @@ def test_iter(d):
 if __name__ == "__main__":
     import argparse
     import theano
-    d = fetch_blizzard(sz='1000')
+    d = fetch_blizzard(sz='fruit')
     test_iter(d)
     X = d["data"]
     X_c = d["chunked_data"]
