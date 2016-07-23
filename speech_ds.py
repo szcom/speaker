@@ -90,6 +90,8 @@ def fetch_blizzard(sz=100, frame_size=4):
                     raise
                 if fs == 16000:
                     w = w[::2]
+                #remove DC
+                w = w - w.mean()    
                 append = np.zeros((frame_size - len(w) % frame_size))
                 w = np.hstack((w,append))
                 w_i = apply_quantize_preproc([w])[0].reshape((-1, frame_size))
