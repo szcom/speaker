@@ -121,6 +121,8 @@ if __name__ == "__main__":
         train_itr.reset()
         prev_h1, prev_h2, prev_h3 = [np_zeros((minibatch_size, n_hid))
                                      for i in range(3)]
+        prev_kappa = np_zeros((minibatch_size, n_att_size))
+        prev_w = np_zeros((minibatch_size, n_chars))
 
         predict_function = checkpoint_dict["predict_function"]
         sample_function = checkpoint_dict["sample_function"]
@@ -130,6 +132,14 @@ if __name__ == "__main__":
         if args.sample_length is None:
             raise ValueError("NYI - use -sl or --sample_length ")
         else:
+            sample_string = 'apple'
+            print("Sampling using sample string %s" % sample_string)
+            oh = speech_ds.dense_to_one_hot(
+                np.array([vocabulary[c] for c in sample_string]),
+                vocabulary_size)
+            c_mb[:len(oh), :, :] = oh[:, None, :]
+            c_mb = c_mb[:len(oh)]
+            c_mb_mask = np.ones((c_mb.shape[0], c_mb.shape[1]), dtype=c_mb.dtype)
             fixed_steps = args.sample_length
             temperature = args.temperature
             completed = []
