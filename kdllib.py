@@ -121,6 +121,7 @@ def print_param_info(params):
     logger.info("Params:")
     for param, value, shape in zip(params, values, shapes):
         logger.info("\t%s (%s)" % (param.name, ",".join([str(x) for x in shape])))
+        #logger.info("\tdata: %s" % value)
 
     total_param_count = 0
     for shape in shapes:
@@ -378,78 +379,130 @@ def midiwrap():
 
 
 class BlizzardThread(threading.Thread):
+    cnt_finished = 0
     """Blizzard Thread"""
-    def __init__(self, queue, out_queue, preproc_fn):
+    def __init__(self, queue, out_queue, preproc_fn, char2code, frame_size):
         threading.Thread.__init__(self)
         self.queue = queue
         self.out_queue = out_queue
         self.preproc_fn = preproc_fn
+        self.char2code = char2code
+        self.frame_size = frame_size
 
     def run(self):
+        cnt = 0
         while True:
             # Grabs image path from queue
+            cnt += 1
             wav_paths, texts = self.queue.get()
-            text_group = texts
-            wav_group = [wavfile.read(wp)[1] for wp in wav_paths]
-            wav_group = [w.astype('float32') / (2 ** 15) for w in wav_group]
-            wav_group = [self.preproc_fn(wi) for wi in wav_group]
-            self.out_queue.put((wav_group, text_group))
+            if wav_paths[0] is None:
+                BlizzardThread.cnt_finished += 1
+                #print('ending worker thread', 'total finished', BlizzardThread.cnt_finished, cnt)
+                self.queue.task_done()
+                return
+            text_group = [filter_tokenize_ind(t.lower(), self.char2code) for t in texts]
+            wav_group = [wavfile.read(wp) for wp in wav_paths]
+            #import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
+            #raise ValueError()
+            wav_group_samples = [w for fs, w in wav_group]
+            for n, (fs, w) in enumerate(wav_group):
+                if fs == 16000:
+                    wav_group_samples[n] = w[::2]
+            wav_group_samples = [w - w.mean() for w in wav_group_samples]
+
+            #wav_group = [w.astype('float32') / (2 ** 15) for w in wav_group]
+            wav_group_samples = [self.preproc_fn(wi, self.frame_size) for wi in wav_group_samples]
+
+            self.out_queue.put((wav_group_samples, text_group))
             self.queue.task_done()
 
+def wav_to_qbins_frames(x, frame_size):
+    x = apply_quantize_preproc([x])[0]
+    if frame_size == 1:
+        return x
+    append = np.zeros((frame_size - len(x) % frame_size))
+    x = np.hstack((x, apply_quantize_preproc([append])[0]))
+    return x.reshape(-1, frame_size)
+            
 
 class Blizzard_dataset(object):
     def __init__(self, minibatch_size=2,
-                 blizzard_path='/home/kkastner/blizzard_data'):
-        self.n_fft = 256
-        self.n_step = self.n_fft // 4
-        self.blizzard_path = blizzard_path
+                 wav_folder_path='wavn_fruit',
+                 prompt_path='prompts_fruit.txt',
+                 preproc_fn=lambda x: x,
+                 thread_cnt=1,
+                 frame_size=1,
+                 fraction_range=[0., 1.]):
+        self.wav_folder_path = wav_folder_path
+        self.prompt_path = prompt_path
+        self._pre = preproc_fn
+        self.thread_cnt = thread_cnt
+        self.frame_size = frame_size
         # extracted text
-        self.text_path = os.path.join(self.blizzard_path, 'train', 'segmented',
-                                      'prompts.gui')
-        with open(self.text_path, 'r') as f:
-            tt = f.readlines()
-            wav_names = [t.strip() for t in tt[::3]]
-            raw_other = tt[2::3]
-            raw_text = [t.strip().lower() for t in tt[1::3]]
+
+        with open(self.prompt_path, 'r') as f:
+            tt = [t.strip().split('\t') for t in f.readlines()]
+            tt=sorted(tt, key=lambda u: len(u[1]))
+            if isinstance(fraction_range[1], float):
+                fraction_range[0] = int(fraction_range[0]*len(tt))
+                fraction_range[1] = int(fraction_range[1]*len(tt))
+            tt = tt[fraction_range[0]:fraction_range[1]]
+
+            wav_names = [t[0] for t in tt]
+            raw_text = [t[1].strip().lower() for t in tt]
             all_symbols = set()
             for rt in raw_text:
                 all_symbols = set(list(all_symbols) + list(set(rt)))
             self.wav_names = wav_names
             self.text = raw_text
             self.symbols = sorted(list(all_symbols))
-        import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
-        raise ValueError()
+        all_chars = ([chr(ord('a') + i) for i in range(26)] +
+                     [',', '.', '!', '?', '<UNK>'])
+        self.symbols = all_chars
+        all_symbols = all_chars ###ZZZ override
+
+        #import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
+        #raise ValueError()
         # These files come from converting the Blizzard mp3 files to wav,
         # then placing in a directory called blizzard_wav
-        self.wav_paths = glob.glob(os.path.join(self.blizzard_path,
-                                                'blizzard_wav', '*.wav'))
+        self.wav_paths = glob.glob(os.path.join(self.wav_folder_path, '*.wav'))
         self.minibatch_size = minibatch_size
         self._lens = np.array([float(len(t)) for t in self.text])
+        self.code2char = dict(enumerate(all_symbols))
+        self.char2code = {v: k for k, v in self.code2char.items()}
+        self.vocabulary_size = len(self.char2code.keys())
+
 
         # Get only the smallest 50% of files for now
         _cut = np.percentile(self._lens, 5)
         _ind = np.where(self._lens <= _cut)[0]
 
-        self.text = [self.text[i] for i in _ind]
-        self.wav_names = [self.wav_names[i] for i in _ind]
+        # ZZZ TODO: put procentile back self.text = [self.text[i] for i in _ind]
+        # ZZZ self.wav_names = [self.wav_names[i] for i in _ind]
         assert len(self.text) == len(self.wav_names)
         final_wav_paths = []
         final_text = []
         final_wav_names = []
         for n, (w, t) in enumerate(zip(self.wav_names, self.text)):
             parts = w.split("chp")
+                
             name = parts[0]
-            chapter = [pp for pp in parts[1].split("_") if pp != ''][0]
+            if len(parts) == 1:
+                chapter = 'wav'
+            else:
+                chapter = [pp for pp in parts[1].split("_") if pp != ''][0]
             for p in self.wav_paths:
                 if name in p and chapter in p:
                     final_wav_paths.append(p)
                     final_wav_names.append(w)
                     final_text.append(t)
-                    import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
-                    raise ValueError()
                     break
 
         # resort into shortest -> longest order
+        #import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
+        #raise ValueError()
+
+        ''' ZZZ - no need for that as we sorted texts up there
         sorted_inds = np.argsort([len(t) for t in final_text])
         st = [final_text[i] for i in sorted_inds]
         swp = [final_wav_paths[i] for i in sorted_inds]
@@ -457,13 +510,16 @@ class Blizzard_dataset(object):
         self.wav_names = swn
         self.wav_paths = swp
         self.text = st
+        '''
+        self.wav_names = final_wav_names
+        self.wav_paths = final_wav_paths
         assert len(self.wav_names) == len(self.wav_paths)
         assert len(self.wav_paths) == len(self.text)
 
         self.n_per_epoch = len(self.wav_paths)
         self.n_samples_seen_ = 0
 
-        self.buffer_size = 2
+        self.buffer_size = 5
         self.minibatch_size = minibatch_size
         self.input_qsize = 5
         self.min_input_qsize = 2
@@ -483,19 +539,25 @@ class Blizzard_dataset(object):
         self.grouped_text = zip(*[iter(self.text)] *
                                      self.minibatch_size)
         assert len(self.grouped_wav_paths) == len(self.grouped_text)
-        self._init_queues()
+
+        #import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
+        #raise ValueError()
+
+        #self._init_queues()
 
     def _init_queues(self):
         # Infinite...
         self.grouped_elements = itertools.cycle(zip(self.grouped_wav_paths,
-                                                self.grouped_text))
+                                                    self.grouped_text))
         self.queue = Queue.Queue()
         self.out_queue = Queue.Queue(maxsize=self.buffer_size)
-
-        for i in range(1):
-            self.it = BlizzardThread(self.queue, self.out_queue, self._pre)
-            self.it.setDaemon(True)
-            self.it.start()
+        self.it = []
+        for i in range(self.thread_cnt):
+            self.it.append(BlizzardThread(self.queue, self.out_queue,
+                                     self._pre, self.char2code,
+                                     self.frame_size))
+            #self.it[-1].setDaemon(True)
+            self.it[-1].start()
 
         # Populate queue with some paths to image data
         for n, _ in enumerate(range(self.input_qsize)):
@@ -513,9 +575,26 @@ class Blizzard_dataset(object):
 
     def reset(self):
         self.n_samples_seen_ = 0
-        self._init_queues()
+        try:
+            with self.queue.mutex:
+                self.queue.queue.clear()
+            with self.out_queue.mutex:
+                self.out_queue.queue.clear()
+                self.out_queue.not_full.notifyAll()
+            for _ in range(self.thread_cnt):
+                exit_flag = ((None,), (None,))
+                self.queue.put(exit_flag, True)
+            for t in self.it:
+                t.join()
+                #print('joined len', len(self.it))
+            del self.queue
+        except AttributeError:
+            pass
 
     def _step(self):
+        if self.n_samples_seen_ == 0:
+            self._init_queues()
+
         if self.n_samples_seen_ >= self.n_per_epoch:
             self.reset()
             raise StopIteration("End of epoch")
@@ -525,7 +604,10 @@ class Blizzard_dataset(object):
             for i in range(self.input_qsize):
                 group = self.grouped_elements.next()
                 self.queue.put(group)
-        return wav_group, text_group
+        li = list_iterator([wav_group, text_group], self.minibatch_size, axis=1, start_index=0,
+                           stop_index=len(wav_group), make_mask=True)
+        return next(li)
+
 
 
 def fetch_sample_audio_chords(n_samples=None):
@@ -1721,14 +1803,20 @@ class list_iterator(base_iterator):
                                        total_shape[1]))
                     new_sc = new_sc.astype(sc[0].dtype)
                     for m, sc_i in enumerate(sc):
-                        new_sc[:len(sc_i), m, :] = sc_i
+                        if len(sc_i.shape) == 1:
+                            new_sc[:len(sc_i), m, :] = sc_i.reshape(-1,1)
+                        else:
+                            new_sc[:len(sc_i), m, :] = sc_i
                 sliced_c[n] = new_sc
             else:
                 # Hit this case if all sequences are the same length
                 if self.axis == 1:
-                    sliced_c[n] = sc.transpose(1, 0, 2)
+                    if len(sc.shape) == 2:
+                        sliced_c[n] = sc.transpose(1, 0)
+                    else:
+                        sliced_c[n] = sc.transpose(1, 0, 2)
         return sliced_c
-
+    
     def _slice_with_masks(self, ind):
         cs = self._slice_without_masks(ind)
         if self.axis == 0:
@@ -1740,7 +1828,10 @@ class list_iterator(base_iterator):
                 for ii, si in enumerate(slc):
                     ms[n][ii, len(si):] = 0.
         elif self.axis == 1:
-            ms = [np.ones_like(c[:, :, 0]) for c in cs]
+            if len(cs[0].shape) == 2:
+                ms = [np.ones_like(c[:, 0]) for c in cs]
+            else:
+                ms = [np.ones_like(c[:, :, 0]) for c in cs]
             sliced_c = []
             for n, c in enumerate(self.list_of_containers):
                 slc = c[ind]
@@ -1882,6 +1973,14 @@ def numpy_one_hot(labels_dense, n_classes=10):
 def tokenize_ind(phrase, vocabulary):
     vocabulary_size = len(vocabulary.keys())
     phrase = [vocabulary[char_] for char_ in phrase]
+    phrase = np.array(phrase, dtype='int32').ravel()
+    phrase = numpy_one_hot(phrase, vocabulary_size)
+    return phrase
+
+def filter_tokenize_ind(phrase, vocabulary):
+    vocabulary_size = len(vocabulary.keys())
+    filter_ = [char_ in vocabulary.keys() for char_ in phrase]
+    phrase = [vocabulary[char_] for char_, cond in zip(phrase, filter_) if cond]
     phrase = np.array(phrase, dtype='int32').ravel()
     phrase = numpy_one_hot(phrase, vocabulary_size)
     return phrase
@@ -4310,8 +4409,10 @@ def set_shared_variables_in_function(func, list_of_values):
     shared_variable_indices = [n for n, var in enumerate(func.maker.inputs)
                                if isinstance(var.variable,
                                              theano.compile.SharedVariable)]
+    print ('i', shared_variable_indices)
     shared_variables = [func.maker.inputs[i].variable
                         for i in shared_variable_indices]
+    print ('ii', shared_variables)
     [s.set_value(v) for s, v in safe_zip(shared_variables, list_of_values)]
 
 
